@@ -244,6 +244,32 @@ def photo_handler(update: Update, context: CallbackContext):
     update.message.reply_text('Ваш пост отправлен администратору.')
 
 
+def message_forward_handler(update: Update, context: CallbackContext):
+    """Пересылка обычных текстовых сообщений админу"""
+    db = Session()
+    admin = db.query(User).filter_by(is_admin=True).first()
+    db.close()
+
+    if not admin:
+        update.message.reply_text("Ошибка: админ не найден.")
+        return
+
+    user = update.effective_user
+    text = update.message.text
+
+    caption = f"📨 Новое текстовое сообщение\n" \
+              f"👤 Отправитель: {user.first_name}\n"
+
+    if user.username:
+        caption += f"🔗 Username: @{user.username}\n"
+
+    caption += f"🆔 ID: {user.id}\n\n" \
+               f"💬 Сообщение:\n{text}"
+
+    context.bot.send_message(admin.user_id, caption)
+    update.message.reply_text("Ваше сообщение отправлено администратору.")
+
+
 def callback_handler(update: Update, context: CallbackContext):
     print('[Predlozhka][callback_handler]Processing admin interaction')
     db = Session()
@@ -292,7 +318,9 @@ updater.dispatcher.add_handler(CommandHandler('removeadmin', remove_admin))
 updater.dispatcher.add_handler(CommandHandler('setchannel', set_channel))
 updater.dispatcher.add_handler(CommandHandler('admins', list_admins))
 
+# основные хендлеры
 updater.dispatcher.add_handler(MessageHandler(Filters.photo & Filters.private, photo_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.text & Filters.private, message_forward_handler))
 updater.dispatcher.add_handler(CallbackQueryHandler(callback_handler))
 
 updater.start_polling()
