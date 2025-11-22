@@ -455,7 +455,6 @@ def callback_handler(update: Update, context: CallbackContext):
     db = Session()
     user = db.query(User).filter_by(user_id=update.effective_user.id).first()
 
-    # всегда answer callback, даже если не админ
     try:
         data = json.loads(update.callback_query.data)
     except Exception:
@@ -478,13 +477,12 @@ def callback_handler(update: Update, context: CallbackContext):
     action = data.get('action')
 
     if action == 'accept':
-        # Публикуем в канал (в том же виде)
         ok = _publish_post_to_channel(post, updater.bot)
         if ok:
             update.callback_query.answer('✅ Пост успешно отправлен')
             try:
                 updater.bot.send_message(post.owner_id, 'Ваш пост опубликован!')
-            except Exception:
+            except:
                 pass
         else:
             update.callback_query.answer('Ошибка при публикации')
@@ -493,20 +491,17 @@ def callback_handler(update: Update, context: CallbackContext):
         update.callback_query.answer('Пост отклонён')
         try:
             updater.bot.send_message(post.owner_id, 'Ваш пост отклонён администратором.')
-        except Exception:
+        except:
             pass
 
     elif action == 'ban':
-        # баним пользователя в канале
         try:
             context.bot.ban_chat_member(target_channel, post.owner_id)
         except Exception as e:
             print('[Predlozhka][BAN] Channel ban error:', e)
 
-        # уведомляем админа
         update.callback_query.answer('Пользователь забанен')
 
-        # пытаемся уведомить пользователя
         try:
             updater.bot.send_message(post.owner_id, "Вы были заблокированы администратором.")
         except:
@@ -515,29 +510,8 @@ def callback_handler(update: Update, context: CallbackContext):
     else:
         update.callback_query.answer('Неизвестное действие')
 
-
-    # Удаляем файлы и запись (если были)
-    if post.attachment_path:
-        try:
-            os.remove(post.attachment_path)
-        except Exception:
-            pass
-
-    # удаляем запись из БД
-    try:
-        db.delete(post)
-        db.commit()
-    except Exception as e:
-        print('[Predlozhka][callback_handler] DB delete error:', e)
-        db.rollback()
-
-    # Удаляем сообщение с кнопками у админа (ту, что с InlineKeyboard)
-    try:
-        updater.bot.delete_message(update.callback_query.message.chat_id, update.callback_query.message.message_id)
-    except Exception:
-        pass
-
     db.close()
+
 
 
 # ============================
