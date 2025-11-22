@@ -236,21 +236,24 @@ def initialize(update: Update, context: CallbackContext):
 def send_to_admin_with_buttons(update: Update, context: CallbackContext, attachment_path=None, text=None):
     db = Session()
 
+    # создаём запись поста
     post = Post(update.effective_user.id, attachment_path, text)
     db.add(post)
     db.commit()
     db.refresh(post)
 
+    # кнопки
     buttons = [[
         InlineKeyboardButton('✅', callback_data=json.dumps({'post': post.post_id, 'action': 'accept'})),
         InlineKeyboardButton('❌', callback_data=json.dumps({'post': post.post_id, 'action': 'decline'})),
         InlineKeyboardButton('BAN', callback_data=json.dumps({'post': post.post_id, 'action': 'ban'}))
     ]]
 
-    admin = db.query(User).filter_by(is_admin=True).first()
+    # список админов
+    admins = db.query(User).filter_by(is_admin=True).all()
 
-    if not admin:
-        update.message.reply_text("Ошибка: админ не найден.")
+    if not admins:
+        update.message.reply_text("Ошибка: администраторы не найдены.")
         db.close()
         return
 
@@ -269,35 +272,43 @@ def send_to_admin_with_buttons(update: Update, context: CallbackContext, attachm
     if text:
         caption += f"\n📝 {text}"
 
+    # определяем тип вложения
     if attachment_path:
         media_type = _guess_type_by_path(attachment_path)
+
+    # отправляем КАЖДОМУ администратору
+    for admin in admins:
         try:
-            if media_type == 'photo':
-                context.bot.send_photo(admin.user_id, open(attachment_path, 'rb'), caption=caption,
-                                       reply_markup=InlineKeyboardMarkup(buttons))
-            elif media_type == 'video':
-                context.bot.send_video(admin.user_id, open(attachment_path, 'rb'), caption=caption,
-                                       reply_markup=InlineKeyboardMarkup(buttons))
-            elif media_type == 'audio':
-                context.bot.send_audio(admin.user_id, open(attachment_path, 'rb'), caption=caption,
-                                       reply_markup=InlineKeyboardMarkup(buttons))
-            elif media_type == 'voice':
-                context.bot.send_voice(admin.user_id, open(attachment_path, 'rb'), caption=caption,
-                                       reply_markup=InlineKeyboardMarkup(buttons))
-            elif media_type == 'sticker':
-                context.bot.send_sticker(admin.user_id, open(attachment_path, 'rb'),
-                                         reply_markup=InlineKeyboardMarkup(buttons))
+            if attachment_path:
+                file = open(attachment_path, 'rb')
+
+                if media_type == 'photo':
+                    context.bot.send_photo(admin.user_id, file, caption=caption,
+                                           reply_markup=InlineKeyboardMarkup(buttons))
+                elif media_type == 'video':
+                    context.bot.send_video(admin.user_id, file, caption=caption,
+                                           reply_markup=InlineKeyboardMarkup(buttons))
+                elif media_type == 'audio':
+                    context.bot.send_audio(admin.user_id, file, caption=caption,
+                                           reply_markup=InlineKeyboardMarkup(buttons))
+                elif media_type == 'voice':
+                    context.bot.send_voice(admin.user_id, file, caption=caption,
+                                           reply_markup=InlineKeyboardMarkup(buttons))
+                elif media_type == 'sticker':
+                    context.bot.send_sticker(admin.user_id, file,
+                                             reply_markup=InlineKeyboardMarkup(buttons))
+                else:
+                    context.bot.send_document(admin.user_id, file, caption=caption,
+                                              reply_markup=InlineKeyboardMarkup(buttons))
             else:
-                context.bot.send_document(admin.user_id, open(attachment_path, 'rb'), caption=caption,
-                                          reply_markup=InlineKeyboardMarkup(buttons))
+                context.bot.send_message(admin.user_id, caption,
+                                         reply_markup=InlineKeyboardMarkup(buttons))
+
         except Exception as e:
-            print('[Error sending attachment]', e)
-            context.bot.send_message(admin.user_id, caption)
-    else:
-        context.bot.send_message(admin.user_id, caption, reply_markup=InlineKeyboardMarkup(buttons))
+            print(f"[Error sending to admin {admin.user_id}]:", e)
 
     db.close()
-    update.message.reply_text("Ваше сообщение отправлено администратору.")
+    update.message.reply_text("Ваше сообщение отправлено администраторам.")
 
 
 # ============================
