@@ -153,7 +153,11 @@ def set_channel(update: Update, context: CallbackContext):
         update.message.reply_text("Использование:\n/setchannel <channel_id>")
         return
 
-    channel_id = context.args[0]
+    try:
+        channel_id = int(context.args[0])
+    except:
+        update.message.reply_text("Ошибка: channel_id должен быть числом.")
+        return
 
     db = Session()
     settings = db.query(Settings).first()
@@ -165,6 +169,7 @@ def set_channel(update: Update, context: CallbackContext):
     target_channel = channel_id
 
     update.message.reply_text(f"📡 Целевой канал обновлён:\n{channel_id}")
+
 
 
 def list_admins(update: Update, context: CallbackContext):
