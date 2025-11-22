@@ -2,6 +2,8 @@ import os
 import logging
 import random
 import json
+import mimetypes
+from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
@@ -50,7 +52,6 @@ session.close()
 
 print('[Predlozhka]Declaring functions and handlers...')
 
-
 # ============================
 #         HELPERS
 # ============================
@@ -60,6 +61,35 @@ def is_admin(user_id):
     user = db.query(User).filter_by(user_id=user_id).first()
     db.close()
     return user and user.is_admin
+
+
+def _unique_path(original_name: str) -> str:
+    """Создаёт уникальный путь в temp с сохранением расширения (если есть)."""
+    base = Path(original_name).name
+    uniq = f"{random.randint(1, 10**12)}_{base}"
+    return os.path.join('temp', uniq)
+
+
+def _guess_type_by_path(path: str) -> str:
+    """Определяем тип медиа по расширению файла."""
+    if not path:
+        return 'text'
+    ext = Path(path).suffix.lower()
+    if ext in ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.heic', '.webp') and ext != '.webp':
+        # note: .webp can be sticker or image — we'll treat .webp as sticker if no caption
+        return 'photo'
+    if ext == '.webp':
+        # could be sticker or image; prefer sticker
+        return 'sticker'
+    if ext in ('.mp4', '.mov', '.mkv', '.avi', '.webm'):
+        return 'video'
+    if ext in ('.mp3', '.m4a', '.flac', '.wav', '.aac'):
+        return 'audio'
+    if ext in ('.ogg', '.oga'):
+        # often voice messages
+        return 'voice'
+    # default to document
+    return 'document'
 
 
 # ============================
@@ -167,8 +197,9 @@ def start(update: Update, context: CallbackContext):
     db = Session()
     if not db.query(User).filter_by(user_id=update.effective_user.id).first():
         db.add(User(update.effective_user.id))
-    update.message.reply_text('Добро пожаловать! Для того чтобы предложить пост, просто отправьте изображение.')
+    update.message.reply_text('Добро пожаловать! Для того чтобы предложить пост, просто отправьте сообщение (текст, фото, документ и т.д.).')
     db.commit()
+    db.close()
 
 
 def initialize(update: Update, context: CallbackContext):
@@ -199,75 +230,224 @@ def initialize(update: Update, context: CallbackContext):
         db.close()
 
 
-def photo_handler(update: Update, context: CallbackContext):
-    print('[Predlozhka][photo_handler]Image accepted, downloading...')
+# ============================
+#  УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ОТПРАВКИ АДМИНУ С КНОПКАМИ
+# ============================
+
+def send_to_admin_with_buttons(update: Update, context: CallbackContext, attachment_path=None, text=None):
+    """Создаёт запись Post и отправляет админу сообщение с двумя кнопками."""
     db = Session()
-    photo = update.message.photo[-1].get_file()
-    path = 'temp/{}_{}'.format(random.randint(1, 100000000000), photo.file_path.split('/')[-1])
-    photo.download(path)
 
-    print('[Predlozhka][photo_handler]Image downloaded, generating post...')
-    post = Post(update.effective_user.id, path, update.message.caption)
+    # Создаём пост — предполагается конструктор Post(owner_id, attachment_path, text)
+    post = Post(update.effective_user.id, attachment_path, text)
     db.add(post)
-    db.commit()
+    db.commit()  # commit чтобы получить post.post_id (если он автогенерируется)
+    db.refresh(post)
 
-    print('[Predlozhka][photo_handler]Sending message to admin...')
     buttons = [
-        [InlineKeyboardButton('✅', callback_data=json.dumps({'post': post.post_id, 'action': 'accept'})),
-         InlineKeyboardButton('❌', callback_data=json.dumps({'post': post.post_id, 'action': 'decline'}))]
+    [
+        InlineKeyboardButton('✅', callback_data=json.dumps({'post': post.post_id, 'action': 'accept'})),
+        InlineKeyboardButton('❌', callback_data=json.dumps({'post': post.post_id, 'action': 'decline'})),
+        InlineKeyboardButton('BAN', callback_data=json.dumps({'post': post.post_id, 'action': 'ban'}))
     ]
+]
+
+
+    admin = db.query(User).filter_by(is_admin=True).first()
+
+    if not admin:
+        update.message.reply_text("Ошибка: админ не найден.")
+        db.close()
+        return
 
     owner = update.effective_user
 
-    caption = f"📩 Новое сообщение в предложку\n" \
-              f"👤 Отправитель: {owner.first_name}\n"
+    caption = (
+        f"📩 Новое сообщение в предложку\n"
+        f"👤 Отправитель: {owner.first_name}\n"
+    )
 
     if owner.username:
         caption += f"🔗 Username: @{owner.username}\n"
 
     caption += f"🆔 ID: {owner.id}\n"
 
-    if post.text:
-        caption += f"\n📝 Текст: {post.text}"
+    if text:
+        caption += f"\n📝 Текст: {text}"
 
-    admin = db.query(User).filter_by(is_admin=True).first()
-
-    updater.bot.send_photo(
-        admin.user_id,
-        open(post.attachment_path, 'rb'),
-        caption,
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    # Если есть attachment_path — определяем тип по расширению и отправляем соответствующим методом
+    if attachment_path:
+        media_type = _guess_type_by_path(attachment_path)
+        try:
+            if media_type == 'photo':
+                context.bot.send_photo(admin.user_id, open(attachment_path, 'rb'), caption=caption, reply_markup=InlineKeyboardMarkup(buttons))
+            elif media_type == 'video':
+                context.bot.send_video(admin.user_id, open(attachment_path, 'rb'), caption=caption, reply_markup=InlineKeyboardMarkup(buttons))
+            elif media_type == 'audio':
+                context.bot.send_audio(admin.user_id, open(attachment_path, 'rb'), caption=caption, reply_markup=InlineKeyboardMarkup(buttons))
+            elif media_type == 'voice':
+                context.bot.send_voice(admin.user_id, open(attachment_path, 'rb'), caption=caption, reply_markup=InlineKeyboardMarkup(buttons))
+            elif media_type == 'sticker':
+                # стикер отправляется как sticker; caption не поддерживается
+                context.bot.send_sticker(admin.user_id, open(attachment_path, 'rb'), reply_markup=InlineKeyboardMarkup(buttons))
+            else:
+                # document по умолчанию
+                context.bot.send_document(admin.user_id, open(attachment_path, 'rb'), caption=caption, reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception as e:
+            print('[Predlozhka][send_to_admin_with_buttons] Error sending to admin:', e)
+            # fallback — отправляем как сообщение с info и без кнопок
+            context.bot.send_message(admin.user_id, caption)
+    else:
+        # Только текст
+        context.bot.send_message(admin.user_id, caption, reply_markup=InlineKeyboardMarkup(buttons))
 
     db.close()
-
-    update.message.reply_text('Ваш пост отправлен администратору.')
-
-
-def message_forward_handler(update: Update, context: CallbackContext):
-    """Пересылка обычных текстовых сообщений админу"""
-    db = Session()
-    admin = db.query(User).filter_by(is_admin=True).first()
-    db.close()
-
-    if not admin:
-        update.message.reply_text("Ошибка: админ не найден.")
-        return
-
-    user = update.effective_user
-    text = update.message.text
-
-    caption = f"📨 Новое текстовое сообщение\n" \
-              f"👤 Отправитель: {user.first_name}\n"
-
-    if user.username:
-        caption += f"🔗 Username: @{user.username}\n"
-
-    caption += f"🆔 ID: {user.id}\n\n" \
-               f"💬 Сообщение:\n{text}"
-
-    context.bot.send_message(admin.user_id, caption)
     update.message.reply_text("Ваше сообщение отправлено администратору.")
+
+
+# ============================
+#   ХЕНДЛЕРЫ ДЛЯ РАЗНЫХ ТИПОВ СООБЩЕНИЙ
+# ============================
+
+def photo_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][photo_handler]Image accepted, downloading...')
+    photo_file = update.message.photo[-1].get_file()
+    # строим путь, чтобы сохранить расширение
+    original_name = getattr(photo_file, 'file_path', f'{photo_file.file_id}.jpg')
+    path = _unique_path(original_name)
+    try:
+        photo_file.download(path)
+    except Exception:
+        # fallback: просто download to path by file_id
+        photo_file.download(path)
+
+    print('[Predlozhka][photo_handler]Image downloaded, sending to admin...')
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=update.message.caption)
+
+
+def text_handler(update: Update, context: CallbackContext):
+    # текстовые сообщения
+    send_to_admin_with_buttons(update, context, attachment_path=None, text=update.message.text)
+
+
+def document_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][document_handler]Document received, downloading...')
+    doc_file = update.message.document.get_file()
+    original_name = update.message.document.file_name or getattr(doc_file, 'file_path', f'{doc_file.file_id}')
+    path = _unique_path(original_name)
+    try:
+        doc_file.download(path)
+    except Exception:
+        doc_file.download(path)
+
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=update.message.caption or None)
+
+
+def audio_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][audio_handler]Audio received, downloading...')
+    a = update.message.audio.get_file()
+    original_name = getattr(update.message.audio, 'file_name', getattr(a, 'file_path', f'{a.file_id}.mp3'))
+    path = _unique_path(original_name)
+    a.download(path)
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=update.message.caption or None)
+
+
+def voice_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][voice_handler]Voice received, downloading...')
+    v = update.message.voice.get_file()
+    original_name = getattr(v, 'file_path', f'{v.file_id}.ogg')
+    path = _unique_path(original_name)
+    v.download(path)
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=None)
+
+
+def video_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][video_handler]Video received, downloading...')
+    vid = update.message.video.get_file()
+    original_name = getattr(update.message.video, 'file_name', getattr(vid, 'file_path', f'{vid.file_id}.mp4'))
+    path = _unique_path(original_name)
+    vid.download(path)
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=update.message.caption or None)
+
+
+def sticker_handler(update: Update, context: CallbackContext):
+    print('[Predlozhka][sticker_handler]Sticker received, downloading...')
+    st = update.message.sticker.get_file()
+    original_name = f"{st.file_id}.webp"
+    path = _unique_path(original_name)
+    st.download(path)
+    send_to_admin_with_buttons(update, context, attachment_path=path, text=None)
+
+
+# универсальный хендлер — для типов, которые не поймали другие handlers
+def forward_all_handler(update: Update, context: CallbackContext):
+    """Обрабатывает любые оставшиеся типы сообщений и пытается их сохранить/переслать админу с кнопками."""
+    msg = update.message
+
+    # если текст — уже есть специальный хендлер, но на всякий случай:
+    if msg.text:
+        return text_handler(update, context)
+
+    if msg.photo:
+        return photo_handler(update, context)
+
+    if msg.document:
+        return document_handler(update, context)
+
+    if msg.video:
+        return video_handler(update, context)
+
+    if msg.audio:
+        return audio_handler(update, context)
+
+    if msg.voice:
+        return voice_handler(update, context)
+
+    if msg.sticker:
+        return sticker_handler(update, context)
+
+    # fallback — просто отправим краткую нотификацию админу с info и кнопками (без attachment)
+    send_to_admin_with_buttons(update, context, attachment_path=None, text='(неподдерживаемый или редкий тип сообщения)')
+
+
+# ============================
+# CALLBACK
+# ============================
+
+def _publish_post_to_channel(post, bot):
+    """Публикация поста в канал в том же виде, в котором он был прислан (вариант A)."""
+    if not post:
+        return False
+
+    # Если attachment_path пуст — это текст
+    if not post.attachment_path:
+        try:
+            bot.send_message(chat_id=target_channel, text=post.text or '')
+            return True
+        except Exception as e:
+            print('[Predlozhka][_publish_post_to_channel] send_message error:', e)
+            return False
+
+    media_type = _guess_type_by_path(post.attachment_path)
+    try:
+        if media_type == 'photo':
+            bot.send_photo(chat_id=target_channel, photo=open(post.attachment_path, 'rb'), caption=post.text or '')
+        elif media_type == 'video':
+            bot.send_video(chat_id=target_channel, video=open(post.attachment_path, 'rb'), caption=post.text or '')
+        elif media_type == 'audio':
+            bot.send_audio(chat_id=target_channel, audio=open(post.attachment_path, 'rb'), caption=post.text or '')
+        elif media_type == 'voice':
+            bot.send_voice(chat_id=target_channel, voice=open(post.attachment_path, 'rb'), caption=post.text or '')
+        elif media_type == 'sticker':
+            # стикер публикуем как стикер (канал должен поддерживать стикеры)
+            bot.send_sticker(chat_id=target_channel, sticker=open(post.attachment_path, 'rb'))
+        else:
+            # document / fallback
+            bot.send_document(chat_id=target_channel, document=open(post.attachment_path, 'rb'), caption=post.text or '')
+        return True
+    except Exception as e:
+        print('[Predlozhka][_publish_post_to_channel] publish error:', e)
+        return False
 
 
 def callback_handler(update: Update, context: CallbackContext):
@@ -275,33 +455,88 @@ def callback_handler(update: Update, context: CallbackContext):
     db = Session()
     user = db.query(User).filter_by(user_id=update.effective_user.id).first()
 
-    if user and user.is_admin:
+    # всегда answer callback, даже если не админ
+    try:
         data = json.loads(update.callback_query.data)
-        post = db.query(Post).filter_by(post_id=data['post']).first()
+    except Exception:
+        update.callback_query.answer('Неверные данные')
+        db.close()
+        return
 
-        if post:
-            if data['action'] == 'accept':
-                updater.bot.send_photo(target_channel, open(post.attachment_path, 'rb'), caption=post.text)
-                update.callback_query.answer('✅ Пост успешно отправлен')
-                updater.bot.send_message(post.owner_id, 'Ваш пост опубликован!')
-            elif data['action'] == 'decline':
-                update.callback_query.answer('Пост отклонён')
+    post = db.query(Post).filter_by(post_id=data.get('post')).first()
 
+    if not user or not user.is_admin:
+        update.callback_query.answer('Unauthorized')
+        db.close()
+        return
+
+    if not post:
+        update.callback_query.answer('Ошибка: пост не найден')
+        db.close()
+        return
+
+    action = data.get('action')
+
+    if action == 'accept':
+        # Публикуем в канал (в том же виде)
+        ok = _publish_post_to_channel(post, updater.bot)
+        if ok:
+            update.callback_query.answer('✅ Пост успешно отправлен')
             try:
-                os.remove(post.attachment_path)
-            except:
+                updater.bot.send_message(post.owner_id, 'Ваш пост опубликован!')
+            except Exception:
                 pass
-
-            db.delete(post)
-            updater.bot.delete_message(update.callback_query.message.chat_id, update.callback_query.message.message_id)
-
         else:
-            update.callback_query.answer('Ошибка: пост не найден')
+            update.callback_query.answer('Ошибка при публикации')
+
+    elif action == 'decline':
+        update.callback_query.answer('Пост отклонён')
+        try:
+            updater.bot.send_message(post.owner_id, 'Ваш пост отклонён администратором.')
+        except Exception:
+            pass
+
+    elif action == 'ban':
+        # баним пользователя в канале
+        try:
+            context.bot.ban_chat_member(target_channel, post.owner_id)
+        except Exception as e:
+            print('[Predlozhka][BAN] Channel ban error:', e)
+
+        # уведомляем админа
+        update.callback_query.answer('Пользователь забанен')
+
+        # пытаемся уведомить пользователя
+        try:
+            updater.bot.send_message(post.owner_id, "Вы были заблокированы администратором.")
+        except:
+            pass
 
     else:
-        update.callback_query.answer('Unauthorized')
+        update.callback_query.answer('Неизвестное действие')
 
-    db.commit()
+
+    # Удаляем файлы и запись (если были)
+    if post.attachment_path:
+        try:
+            os.remove(post.attachment_path)
+        except Exception:
+            pass
+
+    # удаляем запись из БД
+    try:
+        db.delete(post)
+        db.commit()
+    except Exception as e:
+        print('[Predlozhka][callback_handler] DB delete error:', e)
+        db.rollback()
+
+    # Удаляем сообщение с кнопками у админа (ту, что с InlineKeyboard)
+    try:
+        updater.bot.delete_message(update.callback_query.message.chat_id, update.callback_query.message.message_id)
+    except Exception:
+        pass
+
     db.close()
 
 
@@ -318,9 +553,19 @@ updater.dispatcher.add_handler(CommandHandler('removeadmin', remove_admin))
 updater.dispatcher.add_handler(CommandHandler('setchannel', set_channel))
 updater.dispatcher.add_handler(CommandHandler('admins', list_admins))
 
-# основные хендлеры
+# специализированные хендлеры (чтобы ловить корректный тип раньше универсального)
 updater.dispatcher.add_handler(MessageHandler(Filters.photo & Filters.private, photo_handler))
-updater.dispatcher.add_handler(MessageHandler(Filters.text & Filters.private, message_forward_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.document & Filters.private, document_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.video & Filters.private, video_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.audio & Filters.private, audio_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.voice & Filters.private, voice_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.sticker & Filters.private, sticker_handler))
+updater.dispatcher.add_handler(MessageHandler(Filters.text & Filters.private, text_handler))
+
+# универсальный хендлер — после остальных, чтобы не мешать им
+updater.dispatcher.add_handler(MessageHandler(Filters.all & Filters.private, forward_all_handler))
+
 updater.dispatcher.add_handler(CallbackQueryHandler(callback_handler))
 
 updater.start_polling()
+print('[Predlozhka] Bot started.')
